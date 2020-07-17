@@ -1,0 +1,17 @@
+{application, emr,
+ [{description, "A lightweight map-reduce framework"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib,
+    gproc,
+    lager
+   ]},
+  {env,[]},
+  {modules, [emr_app]},
+  {mod, {emr_app, []}},
+
+  {licenses, ["MIT"]},
+  {links, [{"Github", "https://github.com/leonardb/emr"}]}
+ ]}.
