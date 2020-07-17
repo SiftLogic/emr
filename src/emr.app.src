@@ -13,5 +13,5 @@
   {mod, {emr_app, []}},
 
   {licenses, ["MIT"]},
-  {links, [{"Github", "https://github.com/leonardb/emr"}]}
+  {links, [{"Github", "https://github.com/SiftLogic/emr"}]}
  ]}.
