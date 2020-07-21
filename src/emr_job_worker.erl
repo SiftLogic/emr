@@ -3,6 +3,8 @@
 -behaviour(gen_server).
 
 -export([start_link/3]).
+-export([start_link/4]).
+
 -export([init/1,
          handle_call/3,
          handle_cast/2,
@@ -11,77 +13,93 @@
          code_change/3]).
 
 -export([map_fun_/3]).
-%%-export([reduce_fun_/3]).
+-export([map_reduce_fun_/4]).
+
+-include("emr.hrl").
 
 -define(SERVER, ?MODULE).
 
--record(state, {name :: binary(), reply_to, workers = [], map_fun, tuple_size, empty, accum = #{}}).
+-record(state,
+        {name                           :: binary(),
+         max_workers    = ?MAX_WORKERS  :: pos_integer(),
+         reply_to                       :: undefined | reference(),
+         workers        = []            :: [] | list(pidref()),
+         waiters        = queue:new()   :: queue:queue(),
+         map_fun                        :: map_fun(),
+         tuple_size                     :: undefined | pos_integer(),
+         empty                          :: undefined | tuple(),
+         reduce_fun                     :: undefined | reduce_fun(),
+         reduce_acc                     :: undefined | reduce_accumulator(),
+         accum                          :: any()
+        }).
 
 start_link(JobName, MapFun, TupleSize) ->
     gen_server:start_link({via, gproc, {n, l, <<JobName/binary, "_worker">>}}, ?MODULE, [JobName, MapFun, TupleSize], []).
 
+start_link(JobName, MapFun, ReduceFun, ReduceAccumulator) ->
+    gen_server:start_link({via, gproc, {n, l, <<JobName/binary, "_worker">>}}, ?MODULE, [JobName, MapFun, ReduceFun, ReduceAccumulator], []).
+
 init([JobName, MapFun, TupleSize]) ->
     process_flag(trap_exit, true),
+    MaxWorkers = application:get_env(emr, max_workers, ?MAX_WORKERS),
     Empty = list_to_tuple(lists:duplicate(TupleSize, 0)),
+    ReduceFun = fun({Key, AddValues}, OAcc)
+                      when tuple_size(AddValues) =:= TupleSize ->
+                        OldValues = maps:get(Key, OAcc, Empty),
+                        NewValues = add_tuples_(AddValues, OldValues),
+                        maps:put(Key, NewValues, OAcc)
+                end,
     State = #state{
                name = JobName,
+               max_workers = MaxWorkers,
                map_fun = MapFun,
+               reduce_fun = ReduceFun,
+               reduce_acc = #{},
                tuple_size = TupleSize,
-               empty = Empty
+               empty = Empty,
+               accum = #{}
+              },
+    {ok, State};
+init([JobName, MapFun, ReduceFun, ReduceAccumulator]) ->
+    process_flag(trap_exit, true),
+    MaxWorkers = application:get_env(emr, max_workers, ?MAX_WORKERS),
+    State = #state{
+               name = JobName,
+               max_workers = MaxWorkers,
+               map_fun = MapFun,
+               reduce_fun = ReduceFun,
+               reduce_acc = ReduceAccumulator,
+               accum = ReduceAccumulator
               },
     {ok, State}.
 
-handle_call(finalize, _From, #state{name = _JobName, workers = [], accum = Accum} = State) ->
+handle_call(finalize, _From, #state{name = _JobName, workers = [], waiters = {[], []}, accum = Accum} = State) ->
     %% lager:info("~p Reply with Accum and stop process", [_JobName]),
     {stop, normal, {ok, Accum}, State};
 handle_call(finalize, From, #state{name = _JobName} = State) ->
     %% lager:info("~p Not yet complete, so wait", [_JobName]),
     {noreply, State#state{reply_to = From}};
-handle_call({queue, Data}, _From,
-            #state{map_fun = MapFun, workers = Workers} = State) ->
-    {Ref, Pid} = spawn_monitor(?MODULE, map_fun_, [Data, MapFun, []]),
-    {reply, ok, State#state{workers = [{Ref, Pid} | Workers]}};
+handle_call({queue, Data}, From, #state{} = State) ->
+    queue_or_wait(From, Data, State);
 handle_call(_Request, _From, State = #state{}) ->
     {reply, ok, State}.
 
-handle_cast({reduce, Key, AddValues},
-            #state{tuple_size = TSize, empty = Empty, accum = Acc} = State)
-  when tuple_size(AddValues) =:= TSize ->
-    OldValues = maps:get(Key, Acc, Empty),
-    NewValues = add_tuples_(AddValues, OldValues),
-    {noreply, State#state{accum = maps:put(Key, NewValues, Acc)}};
 handle_cast(stop, #state{} = State) ->
     {stop, normal, State};
 handle_cast(_Request, State = #state{}) ->
     {noreply, State}.
 
-handle_info({'DOWN', Ref, process, Pid, {normal, Intermediary}},
-            #state{name = _JobName, workers = Workers,
-                   empty = Empty, tuple_size = TupleSize,
-                   accum = Acc, reply_to = ReplyTo} = State) ->
-    NewState = case lists:member({Pid, Ref}, Workers) of
-                   false ->
-                       State;
-                   true ->
-                       %% lager:info("Map process ~p for job ~p completed", [Pid, _JobName]),
-                       State#state{
-                         workers = lists:delete({Pid, Ref}, Workers),
-                         accum = reduce_(Intermediary, Empty, TupleSize, Acc)
-                        }
-               end,
-    case NewState#state.workers of
-        [] when ReplyTo =/= undefined ->
-            gen_server:reply(ReplyTo, {ok, NewState#state.accum}),
-            {stop, normal, NewState};
-        _ ->
-            {noreply, NewState}
-    end;
+handle_info({'DOWN', Ref, process, Pid, {normal, Intermediary}}, #state{} = State0) ->
+    State1 = do_remove_worker({Ref, Pid}, State0),
+    State2 = do_accum(Intermediary, State1),
+    State3 = maybe_dequeue(State2),
+    reply_after_accum(State3);
 handle_info(_Info, #state{} = State) ->
     lager:info("Unknown info: ~p ~p", [_Info, State]),
     {noreply, State}.
 
-terminate(_Reason, #state{} = State) ->
-    %%lager:info("Got terminate: ~p ~p", [_Reason, State]),
+terminate(_Reason, #state{} = _State) ->
+    %%lager:info("Got terminate: ~p ~p", [_Reason, _State]),
     ok.
 
 code_change(_OldVsn, #state{} = State, _Extra) ->
@@ -91,18 +109,75 @@ code_change(_OldVsn, #state{} = State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+do_spawn(Data, #state{map_fun = MapFun, reduce_fun = ReduceFun, reduce_acc = ReduceAccum}) ->
+    spawn_monitor(?MODULE, map_reduce_fun_, [Data, MapFun, ReduceFun, ReduceAccum]).
+
+
 map_fun_([], _MapFun, Acc) ->
     exit({normal, Acc});
 map_fun_([Row | Rest], MapFun, Acc) ->
     map_fun_(Rest, MapFun, [MapFun(Row) | Acc]).
 
-reduce_([], _Empty, _TupleSize, Acc) ->
+map_reduce_fun_([], _MapFun, _ReduceFun, Acc) ->
+    timer:sleep(timer:seconds(5)),
+    exit({normal, Acc});
+map_reduce_fun_([Row | Rest], MapFun, ReduceFun, Acc) ->
+    NewAcc = ReduceFun(MapFun(Row), Acc),
+    map_reduce_fun_(Rest, MapFun, ReduceFun, NewAcc).
+
+reduce_(InMap, ReduceFun, Acc) when is_map(InMap) ->
+    maps:fold(fun(K, V, InAcc) ->
+                      ReduceFun({K,V}, InAcc)
+              end,
+              Acc, InMap);
+reduce_([], _ReduceFun, Acc) ->
     Acc;
-reduce_([{Key, AddValues} | Rest], Empty, TupleSize, Acc)
-  when tuple_size(AddValues) =:= TupleSize ->
-    OldValues = maps:get(Key, Acc, Empty),
-    NewValues = add_tuples_(AddValues, OldValues),
-    reduce_(Rest, Empty, TupleSize, maps:put(Key, NewValues, Acc)).
+reduce_([Item | Rest], ReduceFun, Acc) ->
+    reduce_(Rest, ReduceFun, ReduceFun(Item, Acc)).
+
+queue_or_wait(_From, Data, #state{workers = Workers, max_workers = MaxWorkers} = State)
+  when length(Workers) < MaxWorkers ->
+    {Pid, Ref} = do_spawn(Data, State),
+    {reply, ok, State#state{workers = [{Ref, Pid} | Workers]}};
+queue_or_wait(From, Data, #state{waiters = Waiters} = State) ->
+    %% blocks the caller and will reply when the queued
+    %% set of data is assigned to a worker slot
+    NWaiters = queue:in({From, Data}, Waiters),
+    {noreply, State#state{waiters = NWaiters}}.
+
+do_remove_worker(RefPid, #state{workers = Workers} = State) ->
+    State#state{workers = lists:delete(RefPid, Workers)}.
+
+do_accum(Intermediary, #state{reduce_fun = ReduceFun,
+                              accum = Acc} = State) ->
+    State#state{accum = reduce_(Intermediary, ReduceFun, Acc)}.
+
+reply_after_accum(#state{workers = [], reply_to = ReplyTo, accum = Accum} = State)
+  when ReplyTo =/= undefined ->
+    gen_server:reply(ReplyTo, {ok, Accum}),
+    {stop, normal, State};
+reply_after_accum(#state{} = State) ->
+    {noreply, State}.
+
+%% Where there are waiting callers and available slots
+%% a new process is spawned and the waiting caller
+%% will receive an 'ok' response
+maybe_dequeue(#state{waiters = Queue, workers = Workers, max_workers = MaxWorkers} = State) ->
+    case queue:out(Queue) of
+        {empty, Queue} ->
+            State;
+        {{value, {From, Data}}, NQueue} ->
+            NState0 = State#state{waiters = NQueue},
+            {Pid, Ref} = do_spawn(Data, NState0),
+            NState = NState0#state{workers = [{Ref, Pid} | Workers]},
+            gen_server:reply(From, ok),
+            case length(Workers) + 1 < MaxWorkers of
+                true ->
+                    maybe_dequeue(NState);
+                false ->
+                    NState
+            end
+    end.
 
 %% only supports up to 25 elements to add
 %% generated using (with a little replacement afterwards)
